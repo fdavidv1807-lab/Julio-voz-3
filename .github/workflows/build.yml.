@@ -1,0 +1,444 @@
+name: Compilar APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  SHERPA_VERSION: "1.12.39"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generar archivos del proyecto
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'FIN_ARCHIVO_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "julio-voz"
+          include(":app")
+          FIN_ARCHIVO_0
+          mkdir -p .
+          cat > build.gradle.kts <<'FIN_ARCHIVO_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIN_ARCHIVO_1
+          mkdir -p app
+          cat > app/build.gradle.kts <<'FIN_ARCHIVO_2'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.julio.voz"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.julio.voz.kokoro"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+
+              // Los modelos van sin comprimir dentro del APK.
+              androidResources { noCompress += listOf("onnx", "txt", "bin") }
+          }
+
+          dependencies {
+              // Motor oficial sherpa-onnx (AAR descargado por el flujo de GitHub Actions).
+              implementation(files("libs/sherpa-onnx.aar"))
+          }
+          FIN_ARCHIVO_2
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FIN_ARCHIVO_3'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- Sin <uses-permission>: la app no pide NINGÚN permiso (ni internet). -->
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Voz de Julio Kokoro"
+                  android:allowBackup="false"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FIN_ARCHIVO_3
+          mkdir -p app/src/main/kotlin/com/julio/voz
+          cat > app/src/main/kotlin/com/julio/voz/MainActivity.kt <<'FIN_ARCHIVO_4'
+          package com.julio.voz
+
+          import android.app.Activity
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioTrack
+          import android.os.Bundle
+          import android.os.Debug
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.text.InputType
+          import android.view.ViewGroup
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Spinner
+          import android.widget.TextView
+          import com.k2fsa.sherpa.onnx.OfflineTts
+          import com.k2fsa.sherpa.onnx.OfflineTtsConfig
+          import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
+          import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
+          import java.io.File
+          import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicInteger
+
+          /**
+           * Prueba de voz neuronal local (Kokoro vía sherpa-onnx). Sin permisos, sin internet.
+           * El modelo vive en assets/kokoro/{model.onnx, voices.bin, tokens.txt, espeak-ng-data/}.
+           */
+          class MainActivity : Activity() {
+
+              // Voces en español del modelo kokoro-multi-lang-v1_0 (identificadores de hablante).
+              private val sidByVoice = linkedMapOf("em_alex (masculina)" to 29, "ef_dora (femenina)" to 28)
+              private val voices = sidByVoice.keys.toList()
+              private val phrases = listOf(
+                  "Buenos días. ¿Cómo puedo ayudarte hoy?",
+                  "He revisado tus actividades pendientes. Tienes una clase programada para las siete de la mañana.",
+                  "Entendido. He guardado la información correctamente.",
+                  "Permíteme explicarte los detalles y las opciones disponibles.",
+                  "Tu sesión de estudio ha terminado. Es momento de tomar un descanso."
+              )
+
+              private val worker = Executors.newSingleThreadExecutor()
+              private val ui = Handler(Looper.getMainLooper())
+              private val generation = AtomicInteger(0)
+              private var tts: OfflineTts? = null
+              private var track: AudioTrack? = null
+              private var speed = 1.0f
+              private var volume = 1.0f
+
+              private lateinit var input: EditText
+              private lateinit var voiceSpinner: Spinner
+              private lateinit var statusView: TextView
+              private lateinit var generateBtn: Button
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  try { System.loadLibrary("sherpa-onnx-jni") } catch (_: Throwable) { }
+                  buildUi()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  generation.incrementAndGet()
+                  stopAudio()
+                  worker.execute { tts?.free(); tts = null }
+                  worker.shutdown()
+              }
+
+              // ---------- Interfaz ----------
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(16), dp(16), dp(24))
+                  }
+                  fun label(t: String) = TextView(this).apply { text = t; setPadding(0, dp(12), 0, dp(2)) }
+                  fun add(v: android.view.View) = col.addView(
+                      v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  )
+
+                  add(TextView(this).apply { text = "Voz de Julio (Kokoro)"; textSize = 22f })
+                  add(TextView(this).apply { text = "Voz neuronal local. Sin internet ni permisos." })
+
+                  add(label("Voz"))
+                  voiceSpinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, voices)
+                  }
+                  add(voiceSpinner)
+
+                  add(label("Texto"))
+                  input = EditText(this).apply {
+                      setText(phrases[0])
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                      minLines = 3
+                  }
+                  add(input)
+
+                  add(label("Frases de prueba"))
+                  phrases.forEachIndexed { i, p ->
+                      add(Button(this).apply {
+                          text = "${i + 1}. $p"
+                          isAllCaps = false
+                          setOnClickListener { input.setText(p) }
+                      })
+                  }
+
+                  val speedLabel = label("Velocidad: 1.00x")
+                  add(speedLabel)
+                  add(SeekBar(this).apply {
+                      max = 12; progress = 6 // 0.70x a 1.30x
+                      setOnSeekBarChangeListener(listener { p ->
+                          speed = 0.7f + p * 0.05f
+                          speedLabel.text = "Velocidad: %.2fx (se aplica al generar)".format(speed)
+                      })
+                  })
+
+                  val volLabel = label("Volumen: 100%")
+                  add(volLabel)
+                  add(SeekBar(this).apply {
+                      max = 20; progress = 20
+                      setOnSeekBarChangeListener(listener { p ->
+                          volume = p / 20f
+                          volLabel.text = "Volumen: ${p * 5}%"
+                          track?.setVolume(volume)
+                      })
+                  })
+
+                  generateBtn = Button(this).apply {
+                      text = "Generar y reproducir"
+                      setOnClickListener { speak() }
+                  }
+                  add(generateBtn)
+                  add(Button(this).apply {
+                      text = "Detener"
+                      setOnClickListener {
+                          generation.incrementAndGet()
+                          stopAudio()
+                          setStatus("Detenido.")
+                      }
+                  })
+
+                  statusView = TextView(this).apply { setPadding(0, dp(12), 0, 0); text = "Listo." }
+                  add(statusView)
+
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              private fun listener(onChange: (Int) -> Unit) = object : SeekBar.OnSeekBarChangeListener {
+                  override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) = onChange(p)
+                  override fun onStartTrackingTouch(s: SeekBar?) {}
+                  override fun onStopTrackingTouch(s: SeekBar?) {}
+              }
+
+              private fun setStatus(msg: String) { ui.post { statusView.text = msg } }
+
+              // ---------- Voz ----------
+              private fun speak() {
+                  val text = input.text.toString().trim()
+                  if (text.isEmpty()) return
+                  val voice = voiceSpinner.selectedItem as String
+                  val myGen = generation.incrementAndGet()
+                  stopAudio()
+                  val currentSpeed = speed
+                  val sid = sidByVoice[voice] ?: 29
+
+                  worker.execute {
+                      try {
+                          if (tts == null) {
+                              setStatus("Cargando el modelo Kokoro (la primera vez tarda)…")
+                              loadModel()
+                          }
+                          if (generation.get() != myGen) return@execute
+                          setStatus("Generando…")
+                          val t0 = SystemClock.elapsedRealtime()
+                          val audio = tts!!.generate(text, sid, currentSpeed)
+                          val ms = SystemClock.elapsedRealtime() - t0
+                          if (generation.get() != myGen) return@execute
+
+                          val secs = audio.samples.size.toFloat() / audio.sampleRate
+                          val mem = Debug.MemoryInfo().also { Debug.getMemoryInfo(it) }.totalPss / 1024
+                          setStatus(
+                              "Generado en %.2f s · audio %.1f s · %.2fx tiempo real · memoria ~%d MB"
+                                  .format(ms / 1000f, secs, ms / 1000f / secs, mem)
+                          )
+                          play(audio.samples, audio.sampleRate)
+                          ui.postDelayed({
+                              if (generation.get() == myGen) statusView.append("\nReproducción terminada.")
+                          }, (secs * 1000).toLong() + 300)
+                      } catch (t: Throwable) {
+                          setStatus("Error: ${t.message ?: t.javaClass.simpleName}")
+                      }
+                  }
+              }
+
+              private fun loadModel() {
+                  tts?.free(); tts = null
+                  // espeak-ng necesita rutas reales: copiamos sus datos una vez al almacenamiento privado de la app.
+                  val espeakDir = File(filesDir, "kokoro/espeak-ng-data")
+                  if (!File(espeakDir, ".ok").exists()) {
+                      copyAssetDir("kokoro/espeak-ng-data", espeakDir)
+                      File(espeakDir, ".ok").writeText("ok")
+                  }
+                  val kokoro = OfflineTtsKokoroModelConfig(
+                      model = "kokoro/model.onnx",
+                      voices = "kokoro/voices.bin",
+                      tokens = "kokoro/tokens.txt",
+                      dataDir = espeakDir.absolutePath,
+                      lang = "es"
+                  )
+                  val modelConfig = OfflineTtsModelConfig(kokoro = kokoro, numThreads = 2, debug = false, provider = "cpu")
+                  val config = OfflineTtsConfig(model = modelConfig)
+                  tts = OfflineTts(assetManager = assets, config = config)
+              }
+
+              private fun copyAssetDir(assetPath: String, dest: File) {
+                  val children = assets.list(assetPath)
+                  if (children.isNullOrEmpty()) {
+                      dest.parentFile?.mkdirs()
+                      assets.open(assetPath).use { i -> dest.outputStream().use { o -> i.copyTo(o) } }
+                  } else {
+                      dest.mkdirs()
+                      for (c in children) copyAssetDir("$assetPath/$c", File(dest, c))
+                  }
+              }
+
+              private fun play(samples: FloatArray, sampleRate: Int) {
+                  val t = AudioTrack.Builder()
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                              .build()
+                      )
+                      .setAudioFormat(
+                          AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                              .setSampleRate(sampleRate)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                              .build()
+                      )
+                      .setBufferSizeInBytes(samples.size * 4)
+                      .setTransferMode(AudioTrack.MODE_STATIC)
+                      .build()
+                  t.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
+                  t.setVolume(volume)
+                  synchronized(this) { track = t }
+                  t.play()
+              }
+
+              private fun stopAudio() {
+                  synchronized(this) {
+                      track?.let {
+                          try { it.stop() } catch (_: Exception) { }
+                          it.release()
+                      }
+                      track = null
+                  }
+              }
+          }
+          FIN_ARCHIVO_4
+          mkdir -p .
+          cat > README.md <<'FIN_ARCHIVO_5'
+          # Voz de Julio (Kokoro): APK de prueba (proyecto independiente)
+
+          App Android mínima cuyo único fin es **generar y reproducir una voz neuronal real** a partir de cualquier texto, para decidir si la voz te gusta. No toca ni depende de la app principal de Julio.
+
+          ## Qué hace
+          Escribes texto → generas → escuchas → detienes. Eliges entre `em_alex` (masculina, español) y `ef_dora` (femenina, solo para comparar), ajustas velocidad y volumen, y tienes las 5 frases de prueba. Muestra tiempo de generación y memoria aproximada.
+
+          ## Motor y modelos
+          - Motor: **sherpa-onnx** (Apache-2.0), AAR oficial de `github.com/k2-fsa/sherpa-onnx`.
+          - Modelo: **Kokoro-82M multilingüe** (`kokoro-multi-lang-v1_0`) desde los releases oficiales de sherpa-onnx (`tts-models`). Solo hay una voz masculina en español en este modelo.
+          - Todo se descarga **durante la compilación en GitHub**, no en tu teléfono, y los modelos van dentro del APK: la app funciona **sin internet**.
+
+          ## Seguridad y permisos
+          - **Permisos que pide: ninguno.** El manifiesto no declara `INTERNET`, así que la app no puede enviar ni recibir datos por red. No usa micrófono, contactos, archivos ni ubicación.
+          - Sin publicidad, rastreo ni código de terceros aparte del motor sherpa-onnx.
+          - El flujo de compilación imprime el SHA-256 de cada archivo descargado para que lo puedas revisar.
+          - El APK sale firmado con la clave de depuración: sirve para pruebas, no para publicarlo.
+          - Licencias: el código de este proyecto es MIT. **Cada voz tiene su propia licencia**: revisa la ficha de cada modelo antes de distribuirla en Julio.
+
+          ## Cómo obtener el APK desde el teléfono (sin PC)
+          1. En github.com crea un repositorio **nuevo** (por ejemplo `julio-voz-kokoro-apk`), privado si quieres.
+          2. `Add file → Create new file`. En el nombre escribe exactamente `.github/workflows/build.yml` y pega todo el contenido de `build-kokoro-todo-en-uno.yml` (de este ZIP). Guarda con `Commit changes`.
+          3. Pestaña **Actions** → `Compilar APK` → `Run workflow`. Tarda unos minutos.
+          4. Al terminar, entra en esa ejecución y descarga el artefacto **julio-voz-kokoro-apk** (un ZIP con el `.apk`).
+          5. Descomprime, abre el `.apk` e instala (Android pedirá permitir instalar desde tu navegador o gestor de archivos; desactívalo después).
+
+          `build-kokoro-todo-en-uno.yml` genera todos los archivos del proyecto al compilar. Los fuentes legibles están en este mismo ZIP (`app/`, `settings.gradle.kts`, etc.) por si prefieres subirlos tal cual junto con `build.yml`.
+
+          ## Tamaño aproximado
+          El modelo Kokoro es grande: el APK puede pesar unos 300–400 MB. Se ve al compilar (`du -sh`).
+
+          ## Estado honesto
+          - **Nunca se compiló ni se ejecutó** (el entorno donde se escribió no tiene internet). Es normal que la primera compilación falle y haya que corregir: si pasa, copia el error de la pestaña Actions.
+          - Puntos más probables de fallo: la URL del AAR (cambia `SHERPA_VERSION` en el flujo), el parámetro `lang` de Kokoro según la versión de sherpa-onnx, o los nombres de archivos dentro del modelo.
+          - Ninguna voz ha sido escuchada todavía.
+          - Fuera de alcance por ahora: integrar con Julio.
+          FIN_ARCHIVO_5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Descargar motor (AAR oficial de sherpa-onnx)
+        run: |
+          mkdir -p app/libs
+          curl -fL -o app/libs/sherpa-onnx.aar \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${SHERPA_VERSION}/sherpa-onnx-${SHERPA_VERSION}.aar"
+          sha256sum app/libs/sherpa-onnx.aar
+
+      - name: Descargar Kokoro (modelo oficial de sherpa-onnx)
+        run: |
+          curl -fL -o kokoro.tar.bz2 \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2"
+          sha256sum kokoro.tar.bz2
+          tar xjf kokoro.tar.bz2
+          ls kokoro-multi-lang-v1_0
+          D=app/src/main/assets/kokoro
+          mkdir -p "$D"
+          cp kokoro-multi-lang-v1_0/model.onnx kokoro-multi-lang-v1_0/voices.bin kokoro-multi-lang-v1_0/tokens.txt "$D/"
+          cp -r kokoro-multi-lang-v1_0/espeak-ng-data "$D/espeak-ng-data"
+          rm -rf kokoro-multi-lang-v1_0 kokoro.tar.bz2
+          du -sh "$D"
+
+      - name: Compilar APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: julio-voz-kokoro-apk
+          path: app/build/outputs/apk/debug/*.apk
+
